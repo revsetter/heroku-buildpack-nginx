@@ -1,0 +1,81 @@
+#!/bin/bash
+# Build NGINX and modules for Heroku.
+# This script is designed to run in a Heroku Stack Docker
+# image. More information on the Heroku Stack can be found
+# at https://devcenter.heroku.com/articles/stack
+
+# fail hard
+set -o pipefail
+# fail harder
+set -eu
+
+NGINX_VERSION=${NGINX_VERSION-1.26.2}
+HEADERS_MORE_VERSION=${HEADERS_MORE_VERSION-0.37}
+UUID4_VERSION=${UUID4_VERSION-f8f7ff44e6a8c6cf75232ae4b63d011f2f3b34c1}
+
+nginx_tarball_url=https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
+headers_more_nginx_module_url=https://github.com/openresty/headers-more-nginx-module/archive/v${HEADERS_MORE_VERSION}.tar.gz
+uuid4_url=https://github.com/cybozu/nginx-uuid4-module/archive/${UUID4_VERSION}.tar.gz
+
+temp_dir=$(mktemp -d /tmp/nginx.XXXXXXXXXX)
+
+trap popd EXIT
+pushd "$temp_dir"
+
+echo "Downloading $nginx_tarball_url"
+curl -sSL "$nginx_tarball_url" | tar xzv
+
+echo "Downloading $headers_more_nginx_module_url"
+curl -sSL "$headers_more_nginx_module_url" | tar xvz -C "nginx-${NGINX_VERSION}"
+
+echo "Downloading $uuid4_url"
+curl -sSL "$uuid4_url" | tar xvz -C "nginx-${NGINX_VERSION}"
+
+configure_opts=(
+  --with-pcre
+  --with-http_gzip_static_module
+  --with-http_realip_module
+  --with-http_ssl_module
+  --with-http_sub_module
+  --with-http_stub_status_module
+  --with-http_v2_module
+  --with-stream
+  --with-threads
+  --add-module="${temp_dir}/nginx-${NGINX_VERSION}/headers-more-nginx-module-${HEADERS_MORE_VERSION}"
+  --add-module="${temp_dir}/nginx-${NGINX_VERSION}/nginx-uuid4-module-${UUID4_VERSION}"
+)
+if [[ $STACK == heroku-2[02] ]]; then
+  # we used to build our own PCRE 8.x, and when moving to dynamic linking, we had to ensure all existing regexes in config files continued to work, so we enforced libpcre3 (8.x) usage instead of the newer PCRE2 (10.x), which has stricter validation for certain patterns (example: /[\w-.]/ is not allowed in PCRE2)
+  # but for any newer stacks, we can use the more modern PCRE2
+  configure_opts+=(
+    --without-pcre2
+  )
+fi
+
+# This will build `nginx`
+(
+  cd "nginx-${NGINX_VERSION}"
+  ./configure \
+    --prefix=/tmp/nginx \
+    "${configure_opts[@]}"
+  make install
+  # strip binary (but not the nginx-debug variant further down)
+  find /tmp/nginx -type f \( -executable -o -name '*.a' \) -exec sh -c "file -i '{}' | grep -Eq 'application/x-(archive|(pie-)?executable|sharedlib); charset=binary'" \; -print | xargs strip --strip-unneeded
+)
+
+# This will build `nginx-debug`
+(
+  cd "nginx-${NGINX_VERSION}"
+  ./configure \
+    --with-debug \
+    --prefix=/tmp/nginx-debug \
+    "${configure_opts[@]}"
+  make install
+)
+
+release_dir=$(mktemp -d /tmp/nginx.XXXXXXXXXX)
+
+mv /tmp/nginx/sbin/nginx "$release_dir/nginx"
+mv /tmp/nginx-debug/sbin/nginx "$release_dir/nginx-debug"
+mv /tmp/nginx/conf/mime.types "$release_dir/mime.types"
+tar -zcvf "$1" -C "$release_dir" .
